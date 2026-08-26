@@ -31,6 +31,9 @@ enum VaultOp {
     ReportYield { yield_bps: u32 },
     ReportLoss { loss_bps: u32 },
     CollectFees,
+    Withdraw { user_idx: usize, shares: i128 },
+    ReportYield { amount: i128 },
+    ReportLoss { amount: i128 },
 }
 
 fn amount_strategy() -> impl Strategy<Value = i128> {
@@ -55,6 +58,20 @@ fn op_strategy(num_users: usize) -> impl Strategy<Value = VaultOp> {
         1 => (1_u32..=1_000_u32)
             .prop_map(|loss_bps| VaultOp::ReportLoss { loss_bps }),
         1 => Just(VaultOp::CollectFees),
+        (0..num_users, amount_strategy()).prop_map(|(user_idx, amount)| VaultOp::Deposit {
+            user_idx,
+            amount,
+        }),
+        (0..num_users, amount_strategy()).prop_map(|(user_idx, shares)| VaultOp::Withdraw {
+            user_idx,
+            shares,
+        }),
+        (0..10_000_i128).prop_map(|amount| VaultOp::ReportYield {
+            amount: amount * XLM / 100,
+        }),
+        (1..1_000_i128).prop_map(|amount| VaultOp::ReportLoss {
+            amount: amount * XLM / 100,
+        }),
     ]
 }
 
@@ -256,6 +273,122 @@ proptest! {
                 }
                 VaultOp::CollectFees => {
                     h.vault().collect_fees(&h.admin);
+
+                    let result = h.vault().try_deposit(&users[user_idx], &amount, &0);
+
+                    if result.is_ok() {
+                        model.deposit(user_idx, amount);
+                        prop_assert!(
+                            model.check_conservation(),
+                            "share balance consistency violated after deposit"
+                        );
+                    }
+                }
+                VaultOp::Withdraw { user_idx, shares } => {
+                    let owned = h.token().balance(&users[user_idx]);
+                    let actual_shares = shares.min(owned);
+                    if actual_shares == 0 {
+                        continue;
+                    }
+
+                    let result = h
+                        .vault()
+                        .try_withdraw(&users[user_idx], &actual_shares, &0);
+
+                    if let Ok(_) = result {
+                        model.withdraw(user_idx, actual_shares);
+                        prop_assert!(
+                            model.check_conservation(),
+                            "share balance consistency violated after withdraw"
+                        );
+                    }
+                }
+                VaultOp::ReportYield { amount } => {
+                    if amount > 0 {
+                        model.report_yield(amount);
+                    }
+                }
+                VaultOp::ReportLoss { amount } => model.report_yield(-amount),
+            }
+        }
+
+        prop_assert!(model.check_conservation(), "final share balance consistency");
+    }
+
+    #[test]
+    fn prop_share_price_non_decreasing_except_real_loss(ops in prop::collection::vec(op_strategy(2), 1..30)) {
+        let (h, users) = setup_harness_with_users(2);
+        h.vault().grant_role(&h.admin, &h.admin, &Role::Manager);
+        let mut prev_price = h.vault().share_price();
+
+        for op in ops {
+            match op {
+                VaultOp::Deposit { user_idx, amount } => {
+                    if amount < MIN_DEPOSIT {
+                        continue;
+                    }
+
+                    let result = h.vault().try_deposit(&users[user_idx], &amount, &0);
+
+                    if let Ok(_) = result {
+                        let current_price = h.vault().share_price();
+                        prop_assert!(
+                            current_price >= prev_price,
+                            "share price decreased: {} -> {}",
+                            prev_price,
+                            current_price
+                        );
+                        prev_price = current_price;
+                    }
+                }
+                VaultOp::Withdraw { user_idx, shares } => {
+                    let actual_shares = shares.min(h.token().balance(&users[user_idx]));
+                    if actual_shares == 0 {
+                        continue;
+                    }
+
+                    let result = h
+                        .vault()
+                        .try_withdraw(&users[user_idx], &actual_shares, &0);
+
+                    if let Ok(_) = result {
+                        let current_price = h.vault().share_price();
+                        // With no shares left there are no remaining holders;
+                        // share_price() intentionally returns its 1.0 bootstrap
+                        // value, so monotonicity is not meaningful in that state.
+                        if h.token().total_supply() > 0 {
+                            prop_assert!(
+                                current_price >= prev_price,
+                                "share price decreased after withdrawal: {} -> {}",
+                                prev_price,
+                                current_price
+                            );
+                        }
+                        prev_price = current_price;
+                    }
+                }
+                VaultOp::ReportYield { amount } => {
+                    if amount > 0 && h.token().total_supply() > 0 {
+                        h.mint_deposit_tokens(&h.vault_id, amount);
+                        h.vault().report_yield(&h.admin, &amount);
+                        let current_price = h.vault().share_price();
+                        prop_assert!(
+                            current_price >= prev_price,
+                            "share price decreased after yield: {} -> {}",
+                            prev_price,
+                            current_price
+                        );
+                        prev_price = current_price;
+                    }
+                }
+                VaultOp::ReportLoss { amount } => {
+                    // A real impairment is the sole operation allowed to lower
+                    // the exchange rate. Whether the sanity guard accepts or
+                    // rejects it, establish the resulting price as the new base.
+                    if h.token().total_supply() > 0 {
+                        h.vault().report_yield(&h.admin, &(-amount));
+                        prev_price = h.vault().share_price();
+                    }
                 }
             }
 
